@@ -475,7 +475,7 @@ static PHP_METHOD(swoole_websocket_server, disconnect)
 {
     zval *zdata;
     zend_long fd = 0;
-    zend_long code = WEBSOCKET_CLOSE_NORMAL;
+    zend_long code = -1;
 
     char *data;
     int length;
@@ -491,13 +491,27 @@ static PHP_METHOD(swoole_websocket_server, disconnect)
         RETURN_FALSE;
     }
 
-    if ((code < 3000 && code != 1000) || code >= 5000)
+    if (code == -1)
+    {
+        // Status code is not set
+        code = WEBSOCKET_CLOSE_STATUS_ERROR;
+    }
+    else if ((code < 3000 && code != 1000) || code >= 5000)
     {
         swoole_php_fatal_error(E_WARNING, "Status code [" ZEND_LONG_FMT "] is invalid.", code);
         RETURN_FALSE;
     }
 
-    length = php_swoole_get_send_data(zdata, &data TSRMLS_CC);
+    if (zdata)
+    {
+        length = php_swoole_get_send_data(zdata, &data TSRMLS_CC);
+    }
+    else
+    {
+        // Status reason is not set
+        code = WEBSOCKET_CLOSE_STATUS_ERROR;
+        length = 0;
+    }
 
     if (length < 0 || length > SW_WEBSOCKET_CLOSE_REASON_MAX_LEN)
     {
@@ -518,13 +532,18 @@ static PHP_METHOD(swoole_websocket_server, disconnect)
     swoole_http_buffer->str[0] = 0x88;
     swoole_http_buffer->str[1] = 0x7F & payload_length;     // Avoid bit 1 being set by accident
 
-    memcpy(swoole_http_buffer->str + SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CLOSE_CODE_LEN, data, length);
-
-    // Encode close code
-    swoole_http_buffer->str[2] = (char)((code >> 8 & 0xFF));
-    swoole_http_buffer->str[3] = (char)((code & 0xFF));
-
-    swoole_http_buffer->length = payload_length + SW_WEBSOCKET_HEADER_LEN;
+    if (code != WEBSOCKET_CLOSE_STATUS_ERROR)
+    {
+        // Encode close code, copy close reason
+        swoole_http_buffer->str[2] = (char)((code >> 8 & 0xFF));
+        swoole_http_buffer->str[3] = (char)((code & 0xFF));
+        memcpy(swoole_http_buffer->str + SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CLOSE_CODE_LEN, data, length);
+        swoole_http_buffer->length = (size_t)payload_length + SW_WEBSOCKET_HEADER_LEN;
+    }
+    else
+    {
+        swoole_http_buffer->length = (size_t)SW_WEBSOCKET_HEADER_LEN;
+    }
 
     int ret = swServer_tcp_send(SwooleG.serv, fd, swoole_http_buffer->str, swoole_http_buffer->length);
 
@@ -534,10 +553,23 @@ static PHP_METHOD(swoole_websocket_server, disconnect)
     // Format swEventData
     swEventData req;
     req.info.fd         = fd;
-    req.info.len        = swoole_http_buffer->length;
+    req.info.len        = (code == WEBSOCKET_CLOSE_STATUS_ERROR ? SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_CLOSE_CODE_LEN 
+                                                                : SW_WEBSOCKET_HEADER_LEN + (size_t)payload_length);
     req.info.from_id    = -1;
     req.info.from_fd    = conn->from_fd;
-    memcpy(&req.data, swoole_http_buffer->str, swoole_http_buffer->length);
+
+    req.data[0] = 1;                        // Flag FIN: 1
+    req.data[1] = WEBSOCKET_OPCODE_CLOSE;   // OPCODE: WEBSOCKET_OPCODE_CLOSE
+
+    if (code != WEBSOCKET_CLOSE_STATUS_ERROR)
+    {
+        memcpy(req.data + SW_WEBSOCKET_HEADER_LEN, swoole_http_buffer->str + SW_WEBSOCKET_HEADER_LEN, (size_t)payload_length);
+    }
+    else
+    {
+        req.data[2] = (char)((code >> 8 & 0xFF));
+        req.data[3] = (char)((code & 0xFF));
+    }
 
     // Call onClose
     swoole_websocket_onMessage(&req);
